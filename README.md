@@ -70,6 +70,12 @@ python3 main.py --dry-run
 
 ถ้า `REQUIRE_ACTIVE_ORDER=true` ระบบจะนับ downtime เฉพาะช่วงที่มี `order` เท่านั้น เพื่อไม่ให้เครื่องว่างหรือไม่มีงานถูกตีเป็น downtime production
 
+ถ้าต้องการ preview ทุกเครื่องแล้วให้แสดงเฉพาะ event ที่เจอ:
+
+```bash
+python3 main.py --dry-run --all-machines
+```
+
 ## Inspect Influx
 
 ```bash

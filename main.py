@@ -85,16 +85,21 @@ def run_flux_query(query: str) -> list[dict]:
         client.close()
 
 
-def build_flux_query() -> str:
+# ฟังก์ชันสำหรับสร้าง Flux query ที่จะใช้ในการดึงข้อมูลตัวอย่างจาก InfluxDB โดยสามารถระบุชื่อเครื่องจักรได้ (หรือดึงข้อมูลของทุกเครื่องจักรถ้าไม่ระบุ) และจะดึงข้อมูลที่เกี่ยวข้องกับความเร็วและหมายเลขคำสั่งซื้อในช่วงเวลาที่กำหนด
+def build_flux_query(machine_name: Optional[str]) -> str:
+    machine_filter = (
+        f'  |> filter(fn: (r) => r["machine"] == "{machine_name}")\n'
+        if machine_name
+        else ""
+    )
     return f"""
 from(bucket: "{INFLUX_BUCKET}")
   |> range(start: -{LOOKBACK_HOURS}h)
   |> filter(fn: (r) => r["_measurement"] == "{MEASUREMENT_NAME}")
-  |> filter(fn: (r) => r["machine"] == "{MACHINE_NAME}")
-  |> filter(fn: (r) => r["_field"] == "{SPEED_FIELD}" or r["_field"] == "{ORDER_FIELD}")
+{machine_filter}  |> filter(fn: (r) => r["_field"] == "{SPEED_FIELD}" or r["_field"] == "{ORDER_FIELD}")
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
   |> filter(fn: (r) => exists r["{SPEED_FIELD}"])
-  |> sort(columns: ["_time"])
+  |> sort(columns: ["machine", "_time"])
   |> tail(n: {QUERY_LIMIT})
 """
 
@@ -108,22 +113,23 @@ def normalize_order_value(value) -> Optional[str]:
     return order_no
 
 # การดึงข้อมูลตัวอย่างจาก InfluxDB โดยใช้ Flux query ที่กำหนดไว้ และแปลงผลลัพธ์เป็น list ของ dict ที่มีข้อมูลที่จำเป็นสำหรับการตรวจจับ downtime events
-def fetch_machine_samples() -> list[dict]:
+def fetch_machine_samples(machine_name: Optional[str]) -> list[dict]:
     client = get_influx_client()
     try:
-        result = client.query_api().query(build_flux_query())
+        result = client.query_api().query(build_flux_query(machine_name))
         rows: list[dict] = []
-        last_order_no: Optional[str] = None
+        last_order_by_machine: dict[str, Optional[str]] = {}
 
         for table in result:
             for record in table.records:
+                machine = str(record.values.get("machine") or machine_name or "")
                 order_no = normalize_order_value(record.values.get(ORDER_FIELD))
                 if order_no is not None:
-                    last_order_no = order_no
+                    last_order_by_machine[machine] = order_no
 
                 rows.append(
                     {
-                        "machine": str(record.values.get("machine") or MACHINE_NAME),
+                        "machine": machine,
                         "factory": str(
                             record.values.get(FACTORY_TAG) or DEFAULT_FACTORY_NAME
                         ),
@@ -131,11 +137,11 @@ def fetch_machine_samples() -> list[dict]:
                             tzinfo=None
                         ),
                         "speed": float(record.values[SPEED_FIELD]),
-                        "order_no": order_no or last_order_no,
+                        "order_no": order_no or last_order_by_machine.get(machine),
                     }
                 )
 
-        rows.sort(key=lambda row: row["time"])
+        rows.sort(key=lambda row: (row["machine"], row["time"]))
         return rows
     finally:
         client.close()
@@ -263,11 +269,15 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
         return []
 
     events: list[dict] = []
-    current_event: Optional[dict] = None
-    previous_row: Optional[dict] = None
+    current_event_by_machine: dict[str, dict] = {}
+    previous_row_by_machine: dict[str, dict] = {}
     max_gap = timedelta(minutes=MAX_SAMPLE_GAP_MINUTES)
 
     for row in samples:
+        machine = row["machine"]
+        current_event = current_event_by_machine.get(machine)
+        previous_row = previous_row_by_machine.get(machine)
+
         if previous_row is not None and current_event is not None:
             if row["time"] - previous_row["time"] > max_gap:
                 events.append(
@@ -336,19 +346,26 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
             )
             current_event = None
 
-        previous_row = row
+        if current_event is None:
+            current_event_by_machine.pop(machine, None)
+        else:
+            current_event_by_machine[machine] = current_event
 
-    if current_event is not None and previous_row is not None:
-        events.append(
-            build_event(
-                current_event["machine"],
-                current_event["factory"],
-                current_event["order_no"],
-                current_event["start_time"],
-                previous_row["time"],
-                "open",
+        previous_row_by_machine[machine] = row
+
+    for machine, current_event in current_event_by_machine.items():
+        previous_row = previous_row_by_machine.get(machine)
+        if previous_row is not None:
+            events.append(
+                build_event(
+                    current_event["machine"],
+                    current_event["factory"],
+                    current_event["order_no"],
+                    current_event["start_time"],
+                    previous_row["time"],
+                    "open",
+                )
             )
-        )
 
     return [event for event in events if event["duration_min"] >= 0]
 
@@ -368,15 +385,18 @@ def write_preview_file(events: list[dict], output_path: Path) -> None:
 
 
 def print_preview_summary(samples: list[dict], events: list[dict], output_path: Path) -> None:
-    print(f"\n=== DOWNTIME PREVIEW ({MACHINE_NAME}) ===")
+    machine_count = len({sample["machine"] for sample in samples})
+    preview_scope = MACHINE_NAME if MACHINE_NAME else "ALL_MACHINES"
+    print(f"\n=== DOWNTIME PREVIEW ({preview_scope}) ===")
     print(f"Influx samples fetched: {len(samples)}")
+    print(f"Machines scanned: {machine_count}")
     print(f"Detected downtime events: {len(events)}")
     print(f"Preview file: {output_path}")
     print(f"Require active order: {REQUIRE_ACTIVE_ORDER}")
 
     for event in events[:20]:
         print(
-            f"ORDER: {event['order_no']} | START: {event['start_time']} | "
+            f"MACHINE: {event['machine']} | ORDER: {event['order_no']} | START: {event['start_time']} | "
             f"END: {event['end_time']} | DURATION: {event['duration_min']} min | "
             f"STATUS: {event['event']}"
         )
@@ -573,18 +593,24 @@ def parse_args():
         action="store_true",
         help="Inspect measurements, tags, fields, and sample rows from InfluxDB.",
     )
+    parser.add_argument(
+        "--all-machines",
+        action="store_true",
+        help="Query all machines and preview only the downtime events found.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    machine_name = None if args.all_machines else MACHINE_NAME
     require_env(require_mysql=not (args.dry_run or args.inspect_influx))
 
     if args.inspect_influx:
         inspect_influx()
         return
 
-    samples = fetch_machine_samples()
+    samples = fetch_machine_samples(machine_name)
     events = detect_downtime_events(samples)
 
     if args.dry_run:
