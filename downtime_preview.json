@@ -1,0 +1,62 @@
+[
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 11:20:29",
+    "end_time": "2026-04-22 11:23:29",
+    "duration_min": 3.0,
+    "event": "STOP",
+    "source": "influx"
+  },
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 12:12:29",
+    "end_time": "2026-04-22 12:15:30",
+    "duration_min": 3.02,
+    "event": "STOP",
+    "source": "influx"
+  },
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 12:17:30",
+    "end_time": "2026-04-22 12:19:29",
+    "duration_min": 1.98,
+    "event": "STOP",
+    "source": "influx"
+  },
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 12:20:29",
+    "end_time": "2026-04-22 12:22:30",
+    "duration_min": 2.02,
+    "event": "STOP",
+    "source": "influx"
+  },
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 12:41:29",
+    "end_time": "2026-04-22 13:09:29",
+    "duration_min": 28.0,
+    "event": "STOP",
+    "source": "influx"
+  },
+  {
+    "machine": "11bc03",
+    "factory": "factory1",
+    "order_no": "111000098262",
+    "start_time": "2026-04-22 13:19:29",
+    "end_time": "2026-04-22 13:29:29",
+    "duration_min": 10.0,
+    "event": "STOP",
+    "source": "influx"
+  }
+]
