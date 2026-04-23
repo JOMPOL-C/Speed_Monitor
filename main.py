@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-import sys
 import mysql.connector
 from dotenv import load_dotenv
 from influxdb_client import InfluxDBClient
@@ -419,8 +418,10 @@ def ensure_schema(connection) -> None:
     schema_sql = SCHEMA_PATH.read_text()
     cursor = connection.cursor()
     try:
-        for _ in cursor.execute(schema_sql, multi=True):
-            pass
+        for statement in schema_sql.split(";"):
+            sql = statement.strip()
+            if sql:
+                cursor.execute(sql)
         connection.commit()
     finally:
         cursor.close()
