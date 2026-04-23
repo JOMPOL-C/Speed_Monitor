@@ -1,4 +1,3 @@
-import os
 from datetime import datetime
 from decimal import Decimal
 from typing import Optional
@@ -9,9 +8,6 @@ from pydantic import BaseModel, Field
 from main import get_mysql_connection
 
 app = FastAPI(title="Speed Monitor API", version="1.0.0")
-
-DEFAULT_LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "6"))
-
 
 class ReasonUpdatePayload(BaseModel): 
     reason_code: Optional[str] = Field(default=None, max_length=50)
@@ -51,10 +47,10 @@ def list_downtime_events(
     connection = get_mysql_connection()
     cursor = connection.cursor(dictionary=True)
     try:
-        where_clauses = [
-            "e.startTime >= DATE_SUB(NOW(), INTERVAL %s HOUR)",
-        ]
-        params: list[object] = [DEFAULT_LOOKBACK_HOURS]
+        # 1. กำหนดค่า Lookback เริ่มต้น (เช่น 24 ชั่วโมง) และเตรียม list สำหรับ params
+        lookback_hours = 24 
+        where_clauses = ["e.startTime >= DATE_SUB(NOW(), INTERVAL %s HOUR)"]
+        params = [lookback_hours] # ต้องมีค่าไปแทน %s ตัวแรกเสมอ
 
         if machine_code:
             where_clauses.append("m.machine_code = %s")
@@ -91,11 +87,13 @@ def list_downtime_events(
         INNER JOIN m_factory f ON f.factoryId = m.factoryId
         LEFT JOIN t_order_number o ON o.orderId = e.orderId
         WHERE {" AND ".join(where_clauses)}
-        ORDER BY e.startTime DESC
-        """
+        ORDER BY e.downtimeId DESC
+        """ 
 
-        cursor.execute(sql, params)
+        # 2. ต้องส่ง params เข้าไปด้วยเสมอเมื่อใน sql มี %s
+        cursor.execute(sql, params) 
         rows = cursor.fetchall()
+        
         for row in rows:
             duration_value = row.get("duration_min")
             if isinstance(duration_value, Decimal):
@@ -104,7 +102,6 @@ def list_downtime_events(
     finally:
         cursor.close()
         connection.close()
-
 
 @app.patch("/api/downtime-events/{downtime_id}/reason")
 def update_downtime_reason(downtime_id: int, payload: ReasonUpdatePayload):
@@ -148,3 +145,4 @@ def update_downtime_reason(downtime_id: int, payload: ReasonUpdatePayload):
     finally:
         cursor.close()
         connection.close()
+        
