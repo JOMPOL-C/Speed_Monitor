@@ -1,7 +1,8 @@
 import argparse
 import json
 import os
-from datetime import timedelta
+
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -35,12 +36,13 @@ SPEED_FIELD = os.getenv("SPEED_FIELD", "linespeed")
 ORDER_FIELD = os.getenv("ORDER_FIELD", "order")
 STOP_THRESHOLD = float(os.getenv("STOP_THRESHOLD", "1"))
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "6"))
+HISTORY_DAYS = int(os.getenv("HISTORY_DAYS", "30"))
 MAX_SAMPLE_GAP_MINUTES = int(os.getenv("MAX_SAMPLE_GAP_MINUTES", "5"))
+SYNC_OVERLAP_MINUTES = int(os.getenv("SYNC_OVERLAP_MINUTES", "10"))
 QUERY_LIMIT = int(os.getenv("QUERY_LIMIT", "1000"))
 REQUIRE_ACTIVE_ORDER = os.getenv("REQUIRE_ACTIVE_ORDER", "true").lower() == "true"
 AUTO_CREATE_TABLES = os.getenv("AUTO_CREATE_TABLES", "true").lower() == "true"
 APP_TIMEZONE = ZoneInfo(os.getenv("APP_TIMEZONE", "Asia/Bangkok"))
-
 
 def require_env(require_mysql: bool = True) -> None:
     required_env = {
@@ -85,21 +87,19 @@ def run_flux_query(query: str) -> list[dict]:
 
 
 # ฟังก์ชันสำหรับสร้าง Flux query ที่จะใช้ในการดึงข้อมูลตัวอย่างจาก InfluxDB โดยสามารถระบุชื่อเครื่องจักรได้ (หรือดึงข้อมูลของทุกเครื่องจักรถ้าไม่ระบุ) และจะดึงข้อมูลที่เกี่ยวข้องกับความเร็วและหมายเลขคำสั่งซื้อในช่วงเวลาที่กำหนด
-def build_flux_query(machine_name: Optional[str]) -> str:
-    machine_filter = (
-        f'  |> filter(fn: (r) => r["machine"] == "{machine_name}")\n'
-        if machine_name
-        else ""
-    )
+def build_flux_query(machine_name: Optional[str], range_start: str) -> str:
+    # ใช้ Filter เหมือนของพี่เขาเพื่อให้ดึงข้อมูลได้แม่นยำขึ้น
+    machine_filter = f'|> filter(fn: (r) => r["machine"] == "{machine_name}")' if machine_name else ""
+    
     return f"""
 from(bucket: "{INFLUX_BUCKET}")
-  |> range(start: -{LOOKBACK_HOURS}h)
+  |> range(start: {range_start})
   |> filter(fn: (r) => r["_measurement"] == "{MEASUREMENT_NAME}")
-{machine_filter}  |> filter(fn: (r) => r["_field"] == "{SPEED_FIELD}" or r["_field"] == "{ORDER_FIELD}")
+  |> filter(fn: (r) => r["_field"] == "{SPEED_FIELD}" or r["_field"] == "{ORDER_FIELD}")
+  {machine_filter}
   |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
-  |> filter(fn: (r) => exists r["{SPEED_FIELD}"])
-  |> sort(columns: ["machine", "_time"])
-  |> tail(n: {QUERY_LIMIT})
+  // เราไม่ต้องทำ stateDuration ในนี้ เพราะเราจะไปทำใน Python ที่แม่นยำกว่า
+  |> sort(columns: ["_time"])
 """
 
 
@@ -111,40 +111,107 @@ def normalize_order_value(value) -> Optional[str]:
         return None
     return order_no
 
-# การดึงข้อมูลตัวอย่างจาก InfluxDB โดยใช้ Flux query ที่กำหนดไว้ และแปลงผลลัพธ์เป็น list ของ dict ที่มีข้อมูลที่จำเป็นสำหรับการตรวจจับ downtime events
-def fetch_machine_samples(machine_name: Optional[str]) -> list[dict]:
+def format_influx_start_time(value: datetime) -> str:
+    localized = value.replace(tzinfo=APP_TIMEZONE)
+    utc_value = localized.astimezone(timezone.utc)
+    return utc_value.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_last_recorded_times() -> dict[str, str]:
+    """หาเวลา endTime ล่าสุดแยกตามเครื่องจาก MySQL เพื่อใช้เป็น watermark ต่อเครื่อง"""
+    try:
+        connection = get_mysql_connection()
+        cursor = connection.cursor()
+
+        cursor.execute(
+            """
+            SELECT m.machine_code, MAX(e.endTime) AS latest_end_time
+            FROM t_downtime_events e
+            INNER JOIN m_machine m ON m.machineId = e.machineId
+            GROUP BY m.machine_code
+            """
+        )
+        result = cursor.fetchall()
+        cursor.close()
+        connection.close()
+
+        return {
+            machine_code: format_influx_start_time(
+                latest_end_time - timedelta(minutes=SYNC_OVERLAP_MINUTES)
+            )
+            for machine_code, latest_end_time in result
+            if machine_code and latest_end_time
+        }
+    except Exception:
+        return {}
+
+
+def list_machine_codes() -> list[str]:
+    query = f"""
+from(bucket: "{INFLUX_BUCKET}")
+  |> range(start: -{HISTORY_DAYS}d)
+  |> filter(fn: (r) => r["_measurement"] == "{MEASUREMENT_NAME}")
+  |> keep(columns: ["machine"])
+  |> group()
+  |> distinct(column: "machine")
+  |> sort(columns: ["machine"])
+"""
+    rows = run_flux_query(query)
+    return sorted(
+        {
+            str(row.get("machine") or row.get("_value") or "")
+            for row in rows
+            if row.get("machine") or row.get("_value")
+        }
+    )
+
+def fetch_samples_for_machine(machine_name: str, start_time: str) -> list[dict]:
     client = get_influx_client()
     try:
-        result = client.query_api().query(build_flux_query(machine_name))
+        result = client.query_api().query(build_flux_query(machine_name, start_time))
         rows: list[dict] = []
-        last_order_by_machine: dict[str, Optional[str]] = {}
 
         for table in result:
             for record in table.records:
-                machine = str(record.values.get("machine") or machine_name or "")
                 order_no = normalize_order_value(record.values.get(ORDER_FIELD))
-                if order_no is not None:
-                    last_order_by_machine[machine] = order_no
 
-                rows.append(
-                    {
-                        "machine": machine,
-                        "factory": str(
-                            record.values.get(FACTORY_TAG) or DEFAULT_FACTORY_NAME
-                        ),
-                        "time": record.get_time().astimezone(APP_TIMEZONE).replace(
-                            tzinfo=None
-                        ),
-                        "speed": float(record.values[SPEED_FIELD]),
-                        "order_no": order_no or last_order_by_machine.get(machine),
-                    }
-                )
+                rows.append({
+                    "machine": str(record.values.get("machine") or machine_name),
+                    "factory": str(record.values.get(FACTORY_TAG) or DEFAULT_FACTORY_NAME),
+                    # แก้ไขบรรทัดนี้: เพิ่ม .replace(microsecond=0) เพื่อตัดทศนิยมทิ้ง
+                    "time": record.get_time().astimezone(APP_TIMEZONE).replace(tzinfo=None, microsecond=0),
+                    "speed": float(record.values[SPEED_FIELD]),
+                    "order_no": order_no,
+                })
 
-        rows.sort(key=lambda row: (row["machine"], row["time"]))
+        rows.sort(key=lambda row: row["time"])
         return rows
     finally:
         client.close()
 
+# ดึงข้อมูลจาก InfluxDB โดยใช้ Flux query ที่สร้างขึ้น และแปลงข้อมูลให้เป็นรูปแบบที่เหมาะสมสำหรับการตรวจจับเหตุการณ์ downtime ต่อไป
+# ฟังก์ชันนี้จะตรวจสอบว่ามีข้อมูล downtime ล่าสุดของเครื่องจักรนั้นๆ ใน MySQL หรือไม่ ถ้ามีจะใช้เวลานั้นเป็นจุดเริ่มต้นในการดึงข้อมูลใหม่จาก InfluxDB เพื่อให้การซิงค์ข้อมูลเป็นแบบ incremental และลดปริมาณข้อมูลที่ต้องดึงมา
+def fetch_machine_samples(machine_name: Optional[str]) -> list[dict]:
+    last_recorded_times = get_last_recorded_times()
+
+    if machine_name:
+        range_start = last_recorded_times.get(machine_name, f"-{HISTORY_DAYS}d")
+        sync_mode = "incremental" if machine_name in last_recorded_times else "historical"
+        print(f"🔄 Syncing {machine_name} in {sync_mode} mode from: {range_start}")
+        return fetch_samples_for_machine(machine_name, range_start)
+
+    rows: list[dict] = []
+    machine_codes = list_machine_codes()
+    print(f"🔄 Syncing all machines: {len(machine_codes)} found")
+
+    for current_machine in machine_codes:
+        range_start = last_recorded_times.get(current_machine, f"-{HISTORY_DAYS}d")
+        sync_mode = "incremental" if current_machine in last_recorded_times else "historical"
+        print(f"  - {current_machine}: {sync_mode} from {range_start}")
+        rows.extend(fetch_samples_for_machine(current_machine, range_start))
+
+    rows.sort(key=lambda row: (row["machine"], row["time"]))
+    return rows
 
 def inspect_influx() -> None:
     measurements_query = f"""
@@ -267,9 +334,7 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
     if not samples:
         return []
 
-    events: list[dict] = []
-    current_event_by_machine: dict[str, dict] = {}
-    previous_row_by_machine: dict[str, dict] = {}
+    events, current_event_by_machine, previous_row_by_machine = [], {}, {}
     max_gap = timedelta(minutes=MAX_SAMPLE_GAP_MINUTES)
 
     for row in samples:
@@ -277,7 +342,11 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
         current_event = current_event_by_machine.get(machine)
         previous_row = previous_row_by_machine.get(machine)
 
-        if previous_row is not None and current_event is not None:
+        current_order = row["order_no"]
+        is_stop = row["speed"] < STOP_THRESHOLD
+        should_track = (not REQUIRE_ACTIVE_ORDER) or (current_order is not None)
+
+        if previous_row and current_event:
             if row["time"] - previous_row["time"] > max_gap:
                 events.append(
                     build_event(
@@ -290,23 +359,7 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
                     )
                 )
                 current_event = None
-            elif (
-                row["order_no"] is not None
-                and current_event["order_no"] is not None
-                and row["order_no"] != current_event["order_no"]
-            ):
-                events.append(
-                    build_event(
-                        current_event["machine"],
-                        current_event["factory"],
-                        current_event["order_no"],
-                        current_event["start_time"],
-                        previous_row["time"],
-                        "closed_by_order_change",
-                    )
-                )
-                current_event = None
-            elif REQUIRE_ACTIVE_ORDER and row["order_no"] is None:
+            elif REQUIRE_ACTIVE_ORDER and current_order is None:
                 events.append(
                     build_event(
                         current_event["machine"],
@@ -318,32 +371,38 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
                     )
                 )
                 current_event = None
+            elif current_event["order_no"] != current_order:
+                events.append(
+                    build_event(
+                        current_event["machine"],
+                        current_event["factory"],
+                        current_event["order_no"],
+                        current_event["start_time"],
+                        previous_row["time"],
+                        "closed_by_order_change",
+                    )
+                )
+                current_event = None
+            elif not is_stop:
+                events.append(
+                    build_event(
+                        current_event["machine"],
+                        current_event["factory"],
+                        current_event["order_no"],
+                        current_event["start_time"],
+                        row["time"],
+                        "STOP",
+                    )
+                )
+                current_event = None
 
-        should_track_row = (not REQUIRE_ACTIVE_ORDER) or (row["order_no"] is not None)
-
-        if (
-            should_track_row
-            and row["speed"] <= STOP_THRESHOLD
-            and current_event is None
-        ):
+        if should_track and is_stop and current_event is None:
             current_event = {
                 "machine": row["machine"],
                 "factory": row["factory"],
-                "order_no": row["order_no"],
+                "order_no": current_order,
                 "start_time": row["time"],
             }
-        elif row["speed"] > STOP_THRESHOLD and current_event is not None:
-            events.append(
-                build_event(
-                    current_event["machine"],
-                    current_event["factory"],
-                    current_event["order_no"],
-                    current_event["start_time"],
-                    row["time"],
-                    "STOP",
-                )
-            )
-            current_event = None
 
         if current_event is None:
             current_event_by_machine.pop(machine, None)
@@ -354,7 +413,7 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
 
     for machine, current_event in current_event_by_machine.items():
         previous_row = previous_row_by_machine.get(machine)
-        if previous_row is not None:
+        if previous_row:
             events.append(
                 build_event(
                     current_event["machine"],
@@ -366,8 +425,7 @@ def detect_downtime_events(samples: list[dict]) -> list[dict]:
                 )
             )
 
-    return [event for event in events if event["duration_min"] >= 0]
-
+    return [e for e in events if e["duration_min"] >= 0]
 
 def write_preview_file(events: list[dict], output_path: Path) -> None:
     serializable_events = [
@@ -383,15 +441,15 @@ def write_preview_file(events: list[dict], output_path: Path) -> None:
     )
 
 
-def print_preview_summary(samples: list[dict], events: list[dict], output_path: Path) -> None:
+def print_preview_summary(samples: list[dict], events: list[dict], output_path: Path, scope_label: str) -> None:
     machine_count = len({sample["machine"] for sample in samples})
-    preview_scope = MACHINE_NAME if MACHINE_NAME else "ALL_MACHINES"
-    print(f"\n=== DOWNTIME PREVIEW ({preview_scope}) ===")
+    print(f"\n=== DOWNTIME PREVIEW ({scope_label}) ===")
     print(f"Influx samples fetched: {len(samples)}")
     print(f"Machines scanned: {machine_count}")
     print(f"Detected downtime events: {len(events)}")
     print(f"Preview file: {output_path}")
     print(f"Require active order: {REQUIRE_ACTIVE_ORDER}")
+
 
     for event in events[:20]:
         print(
@@ -570,8 +628,8 @@ def upsert_downtime_events(connection, events: list[dict]) -> int:
         cursor.close()
 
 
-def print_summary(sample_count: int, event_count: int, affected_rows: int) -> None:
-    print(f"\n=== DOWNTIME SYNC ({MACHINE_NAME}) ===")
+def print_summary(sample_count: int, event_count: int, affected_rows: int, scope_label: str) -> None:
+    print(f"\n=== DOWNTIME SYNC ({scope_label}) ===")
     print(f"Influx samples fetched: {sample_count}")
     print(f"Detected downtime events: {event_count}")
     print(f"Inserted/updated rows in SQL: {affected_rows}")
@@ -605,6 +663,7 @@ def parse_args():
 def main() -> None:
     args = parse_args()
     machine_name = None if args.all_machines else MACHINE_NAME
+    scope_label = "ALL_MACHINES" if args.all_machines else MACHINE_NAME
     require_env(require_mysql=not (args.dry_run or args.inspect_influx))
 
     if args.inspect_influx:
@@ -617,7 +676,7 @@ def main() -> None:
     if args.dry_run:
         output_path = Path(args.preview_output)
         write_preview_file(events, output_path)
-        print_preview_summary(samples, events, output_path)
+        print_preview_summary(samples, events, output_path, scope_label)
         return
 
     connection = get_mysql_connection()
@@ -627,8 +686,7 @@ def main() -> None:
     finally:
         connection.close()
 
-    print_summary(len(samples), len(events), affected_rows)
-
+    print_summary(len(samples), len(events), affected_rows, scope_label)
 
 if __name__ == "__main__":
     main()
