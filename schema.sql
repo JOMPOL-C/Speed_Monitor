@@ -10,6 +10,10 @@ CREATE TABLE IF NOT EXISTS m_machine (
     machineId BIGINT AUTO_INCREMENT PRIMARY KEY,
     factoryId BIGINT NOT NULL,
     machine_code VARCHAR(50) NOT NULL,
+    machine_type VARCHAR(50) NOT NULL,
+    plant VARCHAR(100) NOT NULL,
+    description TEXT NULL,
+    storage_location VARCHAR(255) NULL,
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     UNIQUE KEY uniq_machine_code (machine_code),
@@ -42,8 +46,9 @@ CREATE TABLE IF NOT EXISTS t_downtime_events (
     endTime DATETIME(6) NOT NULL,
     duration_min DECIMAL(10,2) NOT NULL,
     event VARCHAR(50) NOT NULL,
-    reason_code VARCHAR(50) NULL,
-    reason VARCHAR(255) NULL,
+    reason_title VARCHAR(255) NULL, # หัวข้อหลักที่แสดงใน dashboard
+    reason_sub_title VARCHAR(255) NULL, # หัวข้อย่อยที่แสดงใน dashboard
+    note TEXT NULL, # หมายเหตุเพิ่มเติม
     source VARCHAR(20) NOT NULL DEFAULT 'influx',
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -53,11 +58,10 @@ CREATE TABLE IF NOT EXISTS t_downtime_events (
     CONSTRAINT fk_downtime_machine
         FOREIGN KEY (machineId) REFERENCES m_machine(machineId),
     CONSTRAINT fk_downtime_order
-        FOREIGN KEY (orderId) REFERENCES t_order_number(orderId),
-    CONSTRAINT fk_downtime_reason
-        FOREIGN KEY (reason_code) REFERENCES downtime_reason_master(code)
+        FOREIGN KEY (orderId) REFERENCES t_order_number(orderId)
 );
 
+# ตัวอย่างข้อมูลในตาราง downtime_reason_master
 INSERT INTO downtime_reason_master (code, name)
 VALUES
     ('MAT', 'Material shortage'),

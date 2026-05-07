@@ -1,1 +1,4 @@
 .env
+downtime_preview.json
+sync_stdout.log
+sync_stderr.log

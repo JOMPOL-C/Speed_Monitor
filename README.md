@@ -5,7 +5,7 @@
 1. ดึง `linespeed` และ `order` จาก InfluxDB โดยตรง
 2. คำนวณ downtime ใน Python
 3. บันทึกเฉพาะผลลัพธ์ลง `t_downtime_events`
-4. เปิด API ให้ frontend อ่าน downtime และอัปเดต reason ได้
+4. เปิด API ให้ frontend อ่าน downtime และอัปเดต `reason_title`, `reason_sub_title`, `note` ได้
 
 ## โครงสร้างข้อมูล
 
@@ -13,7 +13,7 @@
 - `m_machine`: master เครื่องจักร
 - `t_order_number`: master order
 - `t_downtime_events`: เก็บช่วง downtime ที่ SQL คำนวณได้
-- `downtime_reason_master`: รายการ reason ที่ให้ frontend เลือก
+- `downtime_reason_master`: รายการเหตุผลมาตรฐานที่ให้ frontend เลือก
 
 แนวทางนี้ตั้งใจไม่เก็บ raw sample จาก Influx ลง MySQL เพื่อลดขนาดฐานข้อมูล
 
@@ -42,6 +42,8 @@ ORDER_FIELD=order
 STOP_THRESHOLD=1
 LOOKBACK_HOURS=6
 MAX_SAMPLE_GAP_MINUTES=5
+SYNC_OVERLAP_MINUTES=1
+STATE_CONTEXT_MINUTES=60
 QUERY_LIMIT=5000
 REQUIRE_ACTIVE_ORDER=true
 AUTO_CREATE_TABLES=true
@@ -65,6 +67,11 @@ python3 main.py
 ```bash
 python3 main.py --dry-run
 ```
+
+```bash
+ python3 -m uvicorn api:app --reload      
+```
+
 
 ไฟล์ preview จะถูกสร้างที่ [downtime_preview.json](/Users/sutthiphong/Documents/GitHub/Speed_Monitor/downtime_preview.json) เพื่อใช้เช็ก `start_time`, `end_time`, `duration_min` ก่อนลง SQL
 
@@ -90,6 +97,10 @@ python3 main.py --inspect-influx
 uvicorn api:app --reload
 ```
 
+`api.py` เป็น entrypoint สำหรับ uvicorn ส่วน FastAPI app อยู่ใน `app/server.py`
+และโค้ด endpoint ถูกแยกไว้ใน `app/routers/`
+เพื่อให้เพิ่ม endpoint ใหม่ได้โดยไม่ต้องยัดทุกอย่างไว้ในไฟล์เดียว
+
 ## API ที่ใช้กับ Frontend
 
 - `GET /health`
@@ -97,4 +108,4 @@ uvicorn api:app --reload
 - `GET /api/downtime-events?machine_code=11dw01`
 - `PATCH /api/downtime-events/{downtimeId}/reason`
 
-ตัว sync จะไม่ล้าง `reason_code` และ `reason` ที่ user กรอกไว้ ถ้า downtime event เดิมถูกคำนวณซ้ำในรอบ sync ใหม่ครับ
+ตัว sync จะไม่ล้าง `reason_title`, `reason_sub_title`, และ `note` ที่ user กรอกไว้ ถ้า downtime event เดิมถูกคำนวณซ้ำในรอบ sync ใหม่ครับ
